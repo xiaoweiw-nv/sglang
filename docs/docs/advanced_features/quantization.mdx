@@ -5,6 +5,8 @@ metatags:
 ---
 SGLang supports various quantization methods, including offline quantization and online dynamic quantization.
 
+For the NVIDIA SM100 path that combines MXFP4 routed weights, MXFP8 activations, and a BF16 shared expert, see [W4A8 MegaMoE with a BF16 shared expert](/docs/advanced_features/w4a8_bf16_shared_megamoe).
+
 Offline quantization loads pre-quantized model weights directly during inference. This is required for quantization methods
 such as GPTQ and AWQ, which collect and pre-compute various statistics from the original weights using the calibration dataset.
 

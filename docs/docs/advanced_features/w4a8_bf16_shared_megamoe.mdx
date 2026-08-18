@@ -1,0 +1,182 @@
+---
+title: "W4A8 MegaMoE with a BF16 shared expert"
+description: "Serve MXFP4 routed experts with MXFP8 activations and a fused BF16 shared expert through DeepGEMM MegaMoE."
+---
+
+This path combines MXFP8-activation × MXFP4-weight routed experts with one
+source-local BF16 shared expert. DeepGEMM fuses routed dispatch, routed
+L1/SwiGLU/L2, routed combine, shared L1/SwiGLU/L2, shared scaling, and the
+final add into one MegaMoE kernel.
+
+SGLang keeps the model-specific shared-gate projection and sigmoid outside the
+kernel. For Qwen-style models, it passes the resulting contiguous BF16 scale
+to DeepGEMM.
+
+<Warning>
+This path is opt-in and has no safe routed fallback after MegaMoE weight
+transformation. If a layer is ineligible or its local token count exceeds the
+configured capacity, SGLang raises an error.
+</Warning>
+
+## Prerequisites
+
+Use this path when all of the following are true:
+
+- You run on NVIDIA SM100 GPUs.
+- Launch with `--quantization mxfp4` and use a checkpoint whose routed experts
+  are serialized MXFP4. Accepted metadata includes a `quant_method` containing
+  `mxfp4` or `checkpoint_format: qwen38_routed_experts_mxfp4_v1`.
+- Routed weights remain packed MXFP4 with UE8M0 group-32 scales.
+- The model has exactly one source-local shared expert with contiguous BF16
+  gate/up and down-projection weights.
+- The shared and routed experts use the same intermediate size.
+- The model keeps its shared gate as a separate projection.
+- Every EP rank can import a matching `sgl-deep-gemm` build that exports
+  `fp8_fp4_bf16_shared_mega_moe` and
+  `SymmBuffer.get_bf16_shared_l2_acts`.
+
+Check the DeepGEMM API before starting a multi-node server:
+
+```bash
+python - <<'PY'
+import deep_gemm
+
+assert hasattr(deep_gemm, "fp8_fp4_bf16_shared_mega_moe")
+assert hasattr(deep_gemm.SymmBuffer, "get_bf16_shared_l2_acts")
+print("W4A8_BF16_SHARED_DEEPGEMM_API=PASS")
+PY
+```
+
+Do not enable `SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS` or
+`DG_USE_FP4_ACTS`. This specialization uses MXFP8 activations; either FP4
+activation flag makes the BF16-shared path ineligible.
+
+## Launch a Qwen EP64 server
+
+The following example uses 16 nodes with four GPUs per node, TP64, DP16,
+attention TP4 through DP attention, and EP64. Set the variables on every node
+before launching its server process.
+
+```bash
+MODEL_PATH=/path/to/qwen-mxfp4-checkpoint
+MASTER_ADDR=192.0.2.10
+DIST_PORT=29500
+NODE_RANK=0
+NNODES=16
+
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_BF16_SHARED=1
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=2304
+
+python -m sglang.launch_server \
+  --model-path "${MODEL_PATH}" \
+  --trust-remote-code \
+  --quantization mxfp4 \
+  --fp8-gemm-backend deep_gemm \
+  --moe-a2a-backend megamoe \
+  --moe-runner-backend deep_gemm \
+  --ep-size 64 \
+  --moe-dense-tp-size 1 \
+  --init-expert-location trivial \
+  --disable-shared-experts-fusion \
+  --bf16-gemm-backend torch \
+  --tp-size 64 \
+  --dp-size 16 \
+  --enable-dp-attention \
+  --enable-dp-lm-head \
+  --nnodes "${NNODES}" \
+  --node-rank "${NODE_RANK}" \
+  --dist-init-addr "${MASTER_ADDR}:${DIST_PORT}" \
+  --max-prefill-tokens 8192 \
+  --chunked-prefill-size 32768 \
+  --attention-backend trtllm_mha
+```
+
+Run the command once per node with a unique `NODE_RANK` from 0 through 15.
+The model path must resolve to the same checkpoint on every node.
+
+`--disable-shared-experts-fusion` disables SGLang's generic optimization that
+represents the shared expert as another routed expert. It does not disable this
+mixed-precision MegaMoE specialization. The flag preserves the standalone BF16
+shared module that DeepGEMM consumes inside its fused kernel.
+
+## Size the token capacity
+
+`SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` must cover the
+largest source-local token count that can reach a layer. Include both decode
+CUDA-graph capacity and the effective per-DP prefill chunk.
+
+For the command above:
+
+```text
+chunked_prefill_size = 32768
+dp_size = 16
+effective per-DP prefill chunk = 2048 tokens
+configured MegaMoE capacity = 2304 tokens
+```
+
+DeepGEMM rounds the symmetric-buffer capacity up to its token alignment. Keep
+the configured value large enough for the workload, but do not oversize it
+without measuring because the capacity also affects symmetric-buffer memory
+and kernel scheduling.
+
+## Understand the shared gate
+
+For Qwen-style layers, SGLang evaluates the shared gate before entering
+MegaMoE:
+
+```python
+shared_scale = torch.sigmoid(shared_expert_gate(hidden_states))
+shared_scale = shared_scale.to(torch.bfloat16).contiguous()
+```
+
+DeepGEMM receives `shared_scale`; it does not run the projection or sigmoid.
+The shared expert itself remains source-local, so it requires no dispatch or
+combine communication. Models without a shared gate can call the DeepGEMM API
+with a `None` scale, although the current SGLang integration specifically
+checks for the Qwen-style shared gate.
+
+## Verify kernel selection
+
+On the first eligible layer, each rank logs:
+
+```text
+SGLANG_MEGA_MOE_EXECUTION mode=w4a8_bf16_shared_fused kernel=deep_gemm.fp8_fp4_bf16_shared_mega_moe separate_shared=false
+```
+
+Use this execution marker as the dispatch proof. The current DeepGEMM JIT cache
+retains the historical label below even though the routed MMA is MXFP8 ×
+MXFP4:
+
+```text
+kernel.sm100_fp8_fp8_bf16_shared_mega_moe
+```
+
+The historical JIT label alone does not distinguish W4A8 from W8A8.
+
+If SGLang reports that the BF16 shared MegaMoE request is ineligible, check:
+
+- GPU architecture is SM100.
+- Neither FP4-activation environment variable is enabled.
+- The checkpoint shared weights are BF16 and contiguous.
+- Shared and routed intermediate sizes match.
+- Generic shared-expert fusion is disabled.
+- The matching DeepGEMM API is installed on every rank.
+
+## Run a same-weight unfused control
+
+For controlled A/B measurements, keep the routed MegaMoE path and execute the
+same BF16 shared weights separately:
+
+```bash
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_BF16_SHARED=1
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_UNFUSED_BF16_SHARED=1
+```
+
+This validation-only control runs routed W4A8 MegaMoE plus separate BF16
+shared L1/SwiGLU/L2/gate/combine within this integration. It is not a
+general routed-only W4A8 serving fallback. Do not enable the unfused variable
+for production serving. The control logs:
+
+```text
+SGLANG_MEGA_MOE_EXECUTION mode=w4a8_bf16_shared_unfused_ab kernel=deep_gemm.fp8_fp4_mega_moe separate_shared=true
+```

@@ -146,6 +146,8 @@ Launch with DeepEP and DeepGEMM for DeepSeek-V3:
 python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --moe-a2a-backend deepep --moe-runner-backend deep_gemm --tp 8 --ep 8
 ```
 
+To serve MXFP4 routed experts with a BF16 shared expert on NVIDIA SM100, see [W4A8 MegaMoE with a BF16 shared expert](/docs/advanced_features/w4a8_bf16_shared_megamoe).
+
 ## Extensible EP Framework
 
 SGLang's EP framework provides modular abstractions for easy integration of custom kernels, backends, and optimizations. It decouples the MoE forward pass into stages (dispatch → pre-permute → core runner → post-permute → combine), enabling seamless extensions without refactoring core logic.
