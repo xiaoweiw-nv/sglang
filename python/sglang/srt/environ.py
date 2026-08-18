@@ -1028,6 +1028,12 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    # Opt in to mixed W4A8 routed experts plus a rank-local BF16 shared expert.
+    # Qwen computes the sigmoid gate externally and passes its BF16 scale.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_BF16_SHARED = EnvBool(False)
+    # Same-weight A/B control: keep routed MegaMoE, but execute the BF16 shared
+    # L1/SwiGLU/L2/gate/combine separately.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_UNFUSED_BF16_SHARED = EnvBool(False)
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
     # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer

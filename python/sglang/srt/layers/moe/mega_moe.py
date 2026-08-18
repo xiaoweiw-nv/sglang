@@ -11,10 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Mega-MoE forward path and expert-weight prep shared by Deepseek V2/V4."""
+"""Mega-MoE forward path and expert-weight prep for supported MoE models."""
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
@@ -30,6 +31,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
+from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
@@ -41,8 +43,11 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
+logger = logging.getLogger(__name__)
+
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
+_MEGA_MOE_EXECUTION_MODES_LOGGED: set[str] = set()
 
 
 def _apply_mega_moe_dg_env() -> None:
@@ -71,10 +76,24 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
+    mma_type: str = "fp8xfp4",
+    num_shared_experts: int = 0,
 ) -> SymmBuffer:
     import deep_gemm
 
     _apply_mega_moe_dg_env()
+
+    if num_shared_experts:
+        missing = []
+        if not hasattr(deep_gemm, "fp8_fp4_bf16_shared_mega_moe"):
+            missing.append("fp8_fp4_bf16_shared_mega_moe")
+        if not hasattr(deep_gemm.SymmBuffer, "get_bf16_shared_l2_acts"):
+            missing.append("SymmBuffer.get_bf16_shared_l2_acts")
+        if missing:
+            raise RuntimeError(
+                "W4A8+BF16 shared MegaMoE requires a matching sgl-deep-gemm "
+                f"build; missing: {', '.join(missing)}"
+            )
 
     key = (
         id(group),
@@ -83,6 +102,8 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
+        mma_type,
+        num_shared_experts,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
@@ -93,9 +114,13 @@ def _get_mega_moe_symm_buffer(
             num_topk,
             hidden,
             intermediate_hidden,
-            use_fp8_dispatch=True,
+            mma_type=mma_type,
             activation="swiglu",
+            num_shared_experts=num_shared_experts,
         )
+        if num_shared_experts:
+            assert num_shared_experts == 1
+            buf.get_bf16_shared_l2_acts()
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
 
@@ -104,6 +129,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
+        return False
+    if _can_fuse_mega_moe_shared_expert(moe) and not getattr(
+        moe.shared_expert, "_mega_moe_weights_built", False
+    ):
         return False
     if _device_sm == 90:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
@@ -120,6 +149,71 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     return max_tokens_per_rank <= cap
 
 
+def _bf16_shared_mega_moe_requested() -> bool:
+    return (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_BF16_SHARED.get()
+        or envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_UNFUSED_BF16_SHARED.get()
+    )
+
+
+def _can_fuse_mega_moe_shared_expert(moe: DeepseekV2MoE) -> bool:
+    """Whether a Qwen-style BF16 shared expert matches the W4 fused kernel."""
+    if not _bf16_shared_mega_moe_requested():
+        return False
+    if _device_sm != 100:
+        return False
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
+        return False
+    if os.environ.get("DG_USE_FP4_ACTS", "0") != "0":
+        return False
+    if getattr(moe, "num_fused_shared_experts", 0) != 0:
+        return False
+    shared = getattr(moe, "shared_expert", None)
+    shared_gate = getattr(moe, "shared_expert_gate", None)
+    if shared is None or shared_gate is None:
+        return False
+    if getattr(moe.config, "shared_expert_intermediate_size", None) != getattr(
+        moe.config, "moe_intermediate_size", None
+    ):
+        return False
+    if not getattr(moe.experts, "should_fuse_routed_scaling_factor_in_topk", True):
+        if getattr(moe, "routed_scaling_factor", 1.0) != 1.0:
+            return False
+    gate_up = getattr(shared, "gate_up_proj", None)
+    down = getattr(shared, "down_proj", None)
+    if gate_up is None or down is None:
+        return False
+    if gate_up.weight.dtype != torch.bfloat16 or down.weight.dtype != torch.bfloat16:
+        return False
+    return moe.experts.mega_l1_weights[0].dtype == torch.int8
+
+
+def _get_shared_gate_scale(
+    moe: DeepseekV2MoE, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    if hidden_states.shape[0] == 0:
+        return torch.empty(
+            (1, 1), dtype=torch.bfloat16, device=hidden_states.device
+        )
+    logits = moe.shared_expert_gate(hidden_states)
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return torch.sigmoid(logits).to(dtype=torch.bfloat16).contiguous()
+
+
+def _forward_unfused_bf16_shared(
+    moe: DeepseekV2MoE, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """Run the same BF16 shared weights outside MegaMoE for controlled A/B."""
+    shared = moe.shared_expert
+    assert getattr(shared, "_mega_moe_unfused_bf16_weights", False)
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_empty((0, hidden_states.shape[-1]))
+    l1_output = torch.mm(hidden_states, shared.mega_l1_weights.t())
+    shared_output = torch.mm(shared.act_fn(l1_output), shared.mega_l2_weights.t())
+    return shared_output.mul_(_get_shared_gate_scale(moe, hidden_states))
+
+
 def forward_mega_moe(
     moe: DeepseekV2MoE,
     hidden_states: torch.Tensor,
@@ -127,26 +221,78 @@ def forward_mega_moe(
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
+    shared_fusion_eligible = _can_fuse_mega_moe_shared_expert(moe)
+    if _bf16_shared_mega_moe_requested() and not shared_fusion_eligible:
+        raise RuntimeError(
+            "BF16 shared MegaMoE was requested but this Qwen MoE layer does not "
+            "satisfy the SM100 W4A8/BF16 capability and shape contract"
+        )
+    use_unfused_bf16_shared = shared_fusion_eligible and getattr(
+        moe.shared_expert, "_mega_moe_unfused_bf16_weights", False
+    )
+    use_shared_fusion = shared_fusion_eligible and not use_unfused_bf16_shared
+    if use_shared_fusion:
+        execution_mode = "w4a8_bf16_shared_fused"
+        execution_kernel = "deep_gemm.fp8_fp4_bf16_shared_mega_moe"
+        separate_shared = False
+    elif use_unfused_bf16_shared:
+        execution_mode = "w4a8_bf16_shared_unfused_ab"
+        execution_kernel = "deep_gemm.fp8_fp4_mega_moe"
+        separate_shared = True
+    else:
+        execution_mode = "routed_megamoe_with_model_shared"
+        execution_kernel = "deep_gemm.fp8_fp4_mega_moe"
+        separate_shared = True
+    if execution_mode not in _MEGA_MOE_EXECUTION_MODES_LOGGED:
+        logger.info(
+            "SGLANG_MEGA_MOE_EXECUTION mode=%s kernel=%s separate_shared=%s",
+            execution_mode,
+            execution_kernel,
+            str(separate_shared).lower(),
+        )
+        _MEGA_MOE_EXECUTION_MODES_LOGGED.add(execution_mode)
+
+    shared_scale = None
+    if use_shared_fusion:
+        assert getattr(moe.shared_expert, "_mega_moe_weights_built", False)
+        shared_scale = _get_shared_gate_scale(moe, hidden_states)
 
     sbo_overlap_flag = (
-        moe.alt_stream is not None
+        not use_shared_fusion
+        and moe.alt_stream is not None
         and moe.num_fused_shared_experts == 0
         and num_tokens > 0
         and get_is_capture_mode()
     )
 
-    if sbo_overlap_flag:
+    if use_shared_fusion:
+        shared_output = None
+        mega_stream_ctx = nullcontext()
+    elif sbo_overlap_flag:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
-        shared_output = moe._forward_shared_experts(hidden_states)
+        shared_output = (
+            _forward_unfused_bf16_shared(moe, hidden_states)
+            if use_unfused_bf16_shared
+            else moe._forward_shared_experts(hidden_states)
+        )
         mega_stream_ctx = torch.cuda.stream(moe.alt_stream)
     else:
-        shared_output = moe._forward_shared_experts(hidden_states)
+        shared_output = (
+            _forward_unfused_bf16_shared(moe, hidden_states)
+            if use_unfused_bf16_shared
+            else moe._forward_shared_experts(hidden_states)
+        )
         mega_stream_ctx = nullcontext()
 
     with mega_stream_ctx:
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            shared_scale,
         )
 
     if sbo_overlap_flag:
@@ -163,6 +309,7 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    shared_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     import deep_gemm
 
@@ -171,8 +318,15 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+        if hasattr(moe.config, "n_routed_experts"):
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        else:
+            router_logits = moe.gate(hidden_states)
+            if isinstance(router_logits, tuple):
+                router_logits = router_logits[0]
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(moe, "is_hash", False) else {}
+        )
         topk_output = moe.topk(
             hidden_states,
             router_logits,
@@ -186,6 +340,12 @@ def _run_mega_routed(
             ),
             **topk_kwargs,
         )
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            topk_output = topk_output.to_standard(layer_id=moe.layer_id)
+        assert TopKOutputChecker.format_is_standard(topk_output), (
+            "MegaMoE requires standard top-k output with explicit "
+            "topk_ids/topk_weights"
+        )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
@@ -194,8 +354,14 @@ def _run_mega_routed(
 
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
-    top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
+    top_k = moe.config.num_experts_per_tok + getattr(
+        moe, "num_fused_shared_experts", 0
+    )
     intermediate_size = moe.config.moe_intermediate_size
+    if topk_ids is not None:
+        assert topk_ids.shape[1] == top_k, (
+            f"MegaMoE expected top-k width {top_k}, got {topk_ids.shape[1]}"
+        )
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
@@ -206,6 +372,7 @@ def _run_mega_routed(
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
 
+    num_shared_experts = 1 if shared_scale is not None else 0
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -213,11 +380,13 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
+        mma_type="fp8xfp4",
+        num_shared_experts=num_shared_experts,
     )
 
     if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
-        topk_weights_in = topk_weights.to(torch.float32)
+        topk_ids_in = topk_ids.to(torch.int32).contiguous()
+        topk_weights_in = topk_weights.to(torch.float32).contiguous()
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
@@ -234,9 +403,6 @@ def _run_mega_routed(
 
     use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
     if use_fp4_acts:
-        # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
-        # handles the E2M1 packing variant. The jit implementation
-        # only emits FP8.
         deep_gemm.mega_moe_pre_dispatch(
             hidden_states,
             topk_ids_in,
@@ -261,28 +427,46 @@ def _run_mega_routed(
             quant_group_size=32,
         )
 
-    # Allocate at least one row so y has a non-null CUDA data_ptr;
-    # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
     y = torch.empty(
         (max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
     swiglu_limit = getattr(moe.config, "swiglu_limit", None)
-    deep_gemm.fp8_fp4_mega_moe(
-        y,
-        moe.experts.mega_l1_weights,
-        moe.experts.mega_l2_weights,
-        buf,
-        recipe=(1, 1, 32),
-        activation="swiglu",
-        activation_clamp=swiglu_limit,
-        fast_math=True,
-    )
+    if shared_scale is not None:
+        shared = moe.shared_expert
+        shared_l1_acts = hidden_states if num_tokens > 0 else y
+        deep_gemm.fp8_fp4_bf16_shared_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            shared_l1_acts,
+            shared.mega_l1_weights,
+            shared.mega_l2_weights,
+            shared_scale,
+            buf,
+            num_tokens=num_tokens,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
+    else:
+        deep_gemm.fp8_fp4_mega_moe(
+            y,
+            moe.experts.mega_l1_weights,
+            moe.experts.mega_l2_weights,
+            buf,
+            num_tokens=num_tokens,
+            recipe=(1, 1, 32),
+            activation="swiglu",
+            activation_clamp=swiglu_limit,
+            fast_math=True,
+        )
     y = y[:num_tokens]
 
-    if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
-        y.mul_(moe.routed_scaling_factor)
+    if not getattr(moe.experts, "should_fuse_routed_scaling_factor_in_topk", True):
+        y.mul_(getattr(moe, "routed_scaling_factor", 1.0))
     return y
 
 
@@ -372,3 +556,42 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
 
     experts._mega_moe_weights_built = True
+
+
+def build_mega_moe_shared_expert_weights(moe: DeepseekV2MoE) -> None:
+    """Prepare a rank-local BF16 shared expert for fused or controlled A/B use."""
+    shared = moe.shared_expert
+    if getattr(shared, "_mega_moe_weights_built", False):
+        return
+
+    from deep_gemm import transform_weights_for_mega_moe
+
+    l1_weights = shared.gate_up_proj.weight.data
+    l2_weights = shared.down_proj.weight.data
+    assert l1_weights.dim() == 2 and l2_weights.dim() == 2
+    assert l1_weights.dtype == torch.bfloat16
+    assert l2_weights.dtype == torch.bfloat16
+    assert l1_weights.is_contiguous() and l2_weights.is_contiguous()
+
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_UNFUSED_BF16_SHARED.get():
+        shared.mega_l1_weights = l1_weights
+        shared.mega_l2_weights = l2_weights
+        shared._mega_moe_unfused_bf16_weights = True
+    else:
+        shared.mega_l1_weights, shared.mega_l2_weights = (
+            transform_weights_for_mega_moe(l1_weights, l2_weights)
+        )
+        shared._mega_moe_unfused_bf16_weights = False
+    shared._mega_moe_weights_built = True
+
+
+def build_mega_moe_shared_expert_weights_for_model(model: torch.nn.Module) -> None:
+    """Eagerly prepare supported shared experts before CUDA graph capture."""
+    if not get_moe_a2a_backend().is_megamoe():
+        return
+    for module in model.modules():
+        experts = getattr(module, "experts", None)
+        if not getattr(experts, "_mega_moe_weights_built", False):
+            continue
+        if _can_fuse_mega_moe_shared_expert(module):
+            build_mega_moe_shared_expert_weights(module)

@@ -749,6 +749,14 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.ps.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_shared_expert_weights_for_model,
+            )
+
+            build_mega_moe_shared_expert_weights_for_model(self.model)
 
     def maybe_init_lora_manager(self):
         if get_lora().enable_lora:

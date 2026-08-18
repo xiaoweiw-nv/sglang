@@ -231,6 +231,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
+        self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
@@ -328,6 +329,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         get_moe_a2a_backend().is_deepep()
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_flashinfer()
+                        or get_moe_a2a_backend().is_megamoe()
                     )
                     else {}
                 ),
@@ -590,6 +592,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                forward_mega_moe,
+                should_use_mega_moe,
+            )
+
+            if should_use_mega_moe(self, hidden_states):
+                return forward_mega_moe(self, hidden_states, forward_batch)
+            raise RuntimeError(
+                "MegaMoE backend selected for Qwen, but the layer is unavailable "
+                "or the local token count exceeds "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK. "
+                "MegaMoE-transformed weights have no safe non-MegaMoE fallback."
+            )
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
             return self._forward_deepep(hidden_states, forward_batch)
