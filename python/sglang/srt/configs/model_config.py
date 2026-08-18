@@ -1546,10 +1546,20 @@ class ModelConfig:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = preserve_online_draft_quantization or (
-                    self.quantization in compatible_quantization_methods
-                    and quant_method
-                    in compatible_quantization_methods[self.quantization]
+                is_qwen38_mxfp4_compat = (
+                    self.quantization == "mxfp4"
+                    and quant_method == "mxfp8"
+                    and quant_cfg.get("checkpoint_format")
+                    == "qwen38_routed_experts_mxfp4_v1"
+                )
+                is_compatible = (
+                    is_qwen38_mxfp4_compat
+                    or preserve_online_draft_quantization
+                    or (
+                        self.quantization in compatible_quantization_methods
+                        and quant_method
+                        in compatible_quantization_methods[self.quantization]
+                    )
                 )
                 if is_compatible:
                     # Keep the CLI-specified quantization (e.g., modelopt_fp4) even if

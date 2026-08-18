@@ -249,21 +249,39 @@ class Mxfp4Config(QuantizationConfig):
         self,
         ignored_layers: Optional[list[str]] = None,
         is_checkpoint_mxfp4_serialized: bool = False,
+        checkpoint_scales_are_fp32: bool = False,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
+        self.checkpoint_scales_are_fp32 = checkpoint_scales_are_fp32
 
     @classmethod
     def from_config(cls, config):
 
         quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
+        checkpoint_format = config.get("checkpoint_format")
+        checkpoint_scales_are_fp32 = (
+            checkpoint_format == "qwen38_routed_experts_mxfp4_v1"
+        )
+        is_checkpoint_mxfp4_serialized = (
+            "mxfp4" in quant_method or checkpoint_scales_are_fp32
+        )
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignored_layers", "modules_to_not_convert"], None
+        )
+        if checkpoint_scales_are_fp32 and ignored_layers:
+            ignored_layers = [
+                "self_attn" if layer == "attn" else layer
+                for layer in ignored_layers
+            ]
 
         if _is_hip:
             if is_gfx95_supported():
                 return cls(
-                    is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
+                    ignored_layers=ignored_layers,
+                    is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+                    checkpoint_scales_are_fp32=checkpoint_scales_are_fp32,
                 )
             else:
 
@@ -272,7 +290,11 @@ class Mxfp4Config(QuantizationConfig):
                     f"Current platform {platform} not support mxfp4 computation"
                 )
 
-        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+        return cls(
+            ignored_layers=ignored_layers,
+            is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+            checkpoint_scales_are_fp32=checkpoint_scales_are_fp32,
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -312,11 +334,20 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
-                return Mxfp4MoEMethod(prefix=prefix)
+                return Mxfp4MoEMethod(
+                    prefix=prefix,
+                    checkpoint_scales_are_fp32=self.checkpoint_scales_are_fp32,
+                )
             else:
                 return Mxfp4DynamicQuantMoEMethod()
         else:
             if self.is_checkpoint_mxfp4_serialized:
+                if self.ignored_layers and is_layer_skipped(
+                    prefix=prefix,
+                    ignored_layers=self.ignored_layers,
+                    fused_mapping=self.packed_modules_mapping,
+                ):
+                    return None
                 raise NotImplementedError("Mxfp4 attention layer is not implemented")
         return None
 
@@ -329,10 +360,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(
         self,
         prefix: str,
+        checkpoint_scales_are_fp32: bool = False,
     ):
         super().__init__()
 
         self.prefix = prefix
+        self.checkpoint_scales_are_fp32 = checkpoint_scales_are_fp32
         self.topk_indices_dtype = None
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
@@ -388,7 +421,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ):
         self.num_experts = num_experts
         weight_dtype = torch.uint8
-        scale_dtype = torch.uint8
+        scale_dtype = (
+            torch.float32 if self.checkpoint_scales_are_fp32 else torch.uint8
+        )
+        scale_fill_value = 1.0 if self.checkpoint_scales_are_fp32 else _UE8M0_ONE
         self.with_bias = with_bias
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
@@ -488,7 +524,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition_after_pad,
                     hidden_size // mxfp4_block,
                 ),
-                fill_value=_UE8M0_ONE,
+                fill_value=scale_fill_value,
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -530,7 +566,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition_after_pad // mxfp4_block,
                 ),
-                fill_value=_UE8M0_ONE,
+                fill_value=scale_fill_value,
                 dtype=scale_dtype,
             ),
             requires_grad=False,
@@ -592,7 +628,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 scale = getattr(layer, scale_name)
                 num_experts, n, _ = scale.data.shape
                 k = weight.shape[2] * 2
-                scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
+                scale_f32 = (
+                    scale.data
+                    if scale.data.dtype == torch.float32
+                    else scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
+                )
                 scale.data = transform_sf_into_required_layout(
                     scale_f32,
                     mn=n,
